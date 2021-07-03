@@ -552,6 +552,7 @@ class Volume:
         self.stream = stream
 
         # Superblock
+        self.stream.seek(offset, io.SEEK_SET)
         self.superblock = self.read_struct(ext4_superblock, 0x400)
         self.platform64 = (self.superblock.s_feature_incompat & ext4_superblock.INCOMPAT_64BIT) != 0
 
@@ -603,6 +604,12 @@ class Volume:
             self.stream.seek(self.offset + offset, io.SEEK_SET)
 
         return self.stream.read(byte_len)
+
+    def write(self, offset, data):
+        if self.offset + offset != self.stream.tell():
+            self.stream.seek(self.offset + offset, io.SEEK_SET)
+        self.stream.write(data)
+        self.stream.flush()
 
     def read_struct (self, structure, offset, platform64 = None):
         """
@@ -699,7 +706,7 @@ class Inode:
 
             if xattr_entry.e_value_inum != 0:
                 # external xattr
-                xattr_inode = self.volume.get_inode(xattr.e_value_inum)
+                xattr_inode = self.volume.get_inode(xattr_entry.e_value_inum)
 
                 if not self.volume.ignore_flags and (xattr_inode.inode.i_flags & ext4_inode.EXT4_EA_INODE_FL) != 0:
                     raise Ext4Error(f"Inode {xattr_inode.inode_idx:d} associated with the extended attribute {xattr_name!r:s} of inode {self.inode_idx:d} is not marked as large extended attribute value.")
@@ -858,7 +865,14 @@ class Inode:
             dirent = ext4_dir_entry_2._from_buffer_copy(raw_data, offset, platform64 = self.volume.platform64)
 
             if dirent.file_type != InodeType.CHECKSUM:
-                yield (decode_name(dirent.name), dirent.inode, dirent.file_type)
+                try:
+                    dname = decode_name(dirent.name)
+                except:
+                    print(hex(offset))
+                    #hexdump(raw_data[offset:offset+0x20])
+                    dname = dirent.name
+                yield (dname, dirent.inode, dirent.file_type)
+
 
             offset += dirent.rec_len
 
@@ -1028,6 +1042,20 @@ class BlockReader:
         self.cursor += len(result)
         return result
 
+    def rewrite(self, pending):
+        if len(pending) < self.byte_size:
+            padsize = self.byte_size - len(pending)
+            pending = pending + b'\x00'*padsize
+        elif len(pending) > self.byte_size:
+            pending = pending[:self.byte_size]
+
+        cursor = 0
+        while pending != b'':
+            data = pending[:self.volume.block_size]
+            pending = pending[self.volume.block_size:]
+            self.write_block(cursor, data)
+            cursor += 1
+
     def read_block (self, file_block_idx):
         """
         Reads one block from disk (return a zero-block if the file block is not mapped)
@@ -1038,6 +1066,16 @@ class BlockReader:
             return self.volume.read(disk_block_idx * self.volume.block_size, self.volume.block_size)
         else:
             return bytes([0] * self.volume.block_size)
+
+    def write_block(self, file_block_idx, data, show=0):
+        disk_block_idx = self.get_block_mapping(file_block_idx)
+        if disk_block_idx != None:
+            self.volume.write(disk_block_idx * self.volume.block_size, data, show)
+        else:
+            pass
+            #print("skip", hex(len(data)))
+            #for c in data:
+            #    assert c == 0
 
     def seek (self, seek, seek_mode = io.SEEK_SET):
         """
