@@ -1067,10 +1067,10 @@ class BlockReader:
         else:
             return bytes([0] * self.volume.block_size)
 
-    def write_block(self, file_block_idx, data, show=0):
+    def write_block(self, file_block_idx, data):
         disk_block_idx = self.get_block_mapping(file_block_idx)
         if disk_block_idx != None:
-            self.volume.write(disk_block_idx * self.volume.block_size, data, show)
+            self.volume.write(disk_block_idx * self.volume.block_size, data)
         else:
             pass
             #print("skip", hex(len(data)))
