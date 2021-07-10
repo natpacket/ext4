@@ -3,7 +3,7 @@ import functools
 import io
 import math
 import queue
-
+import struct
 
 
 ########################################################################################################################
@@ -596,6 +596,142 @@ class Volume:
         inode_table_entry_idx = (inode_idx - 1) % self.superblock.s_inodes_per_group
         return (group_idx, inode_table_entry_idx)
 
+    def get_block_group(self, block_idx):
+        """
+        Returns a tuple (group_idx, block_bitmap_entry_idx)
+        """
+        group_idx = (block_idx - 1) // self.superblock.s_blocks_per_group
+        block_bitmap_entry_idx =  (block_idx - 1) % self.superblock.s_blocks_per_group
+        return(group_idx, block_bitmap_entry_idx)
+
+    def get_block_inuse_bit (self, block_idx):
+        """
+        Return block's inuse bit
+        """
+        group_idx, block_bitmap_entry_idx = self.get_block_group(block_idx)
+        group_descriptor = self.group_descriptors[group_idx]
+
+        bitmap_offset = group_descriptor.bg_block_bitmap * self.block_size
+        bitmap_byte_offset = bitmap_offset + block_bitmap_entry_idx // 8
+        block_usage_byte = self.read(bitmap_byte_offset, 1)[0]
+        return ((block_usage_byte >> (block_bitmap_entry_idx & 7)) & 1)
+
+    def set_block_inuse_bit (self, block_idx, bit):
+        """
+        Set block's inuse bit
+        """
+        group_idx, block_bitmap_entry_idx = self.get_block_group(block_idx)
+        group_descriptor = self.group_descriptors[group_idx]
+
+        bitmap_offset = group_descriptor.bg_block_bitmap * self.block_size
+        bitmap_byte_offset = bitmap_offset + block_bitmap_entry_idx // 8
+
+        block_usage_byte = self.read(bitmap_byte_offset, 1)[0]
+        if bit:
+            block_usage_byte = block_usage_byte | (1 << block_bitmap_entry_idx & 7)
+        else:
+            block_usage_byte = block_usage_byte & ~(1 << block_bitmap_entry_idx & 7)
+        self.write(bitmap_byte_offset, bytes([block_usage_byte]))
+
+    def get_free_block_count_ingroup (self, group_idx, from_bitmap_idx, to_bitmap_idx):
+        """
+        Get free blocks' count
+        """
+        group_descriptor = self.group_descriptors[group_idx]
+        bitmap_offset = group_descriptor.bg_block_bitmap * self.block_size
+        total_block_count = to_bitmap_idx - from_bitmap_idx
+        inuse_block_count = 0
+
+        # handle first byte in bitmap
+        if from_bitmap_idx % 8 != 0:
+            mid_bitmap_idx = from_bitmap_idx + 8 - from_bitmap_idx % 8
+            if mid_bitmap_idx > to_bitmap_idx:
+                mid_bitmap_idx = to_bitmap_idx
+            for i in range(from_bitmap_idx, mid_bitmap_idx):
+                if self.get_block_inuse_bit(i):
+                    inuse_block_count += 1
+            if mid_bitmap_idx == to_bitmap_idx:
+                return total_block_count - inuse_block_count
+            from_bitmap_idx = mid_bitmap_idx
+
+        # middle qwords
+        from_bytes_offset = from_bitmap_idx // 8
+        to_bytes_offset = to_bitmap_idx // 8
+        bytes_len = to_bytes_offset - from_bytes_offset
+        while bytes_len > 8:
+            bitnumber = struct.unpack("<Q", self.read(bitmap_offset + from_bytes_offset, 8))
+            while bitnumber != 0:
+                bitnumber = bitnumber & (bitnumber - 1)
+                inuse_block_count += 1
+            from_bytes_offset += 8
+            bytes_len -= 8
+
+        # remained bytes
+        while bytes_len > 0:
+            bitnumber = self.read(bitmap_offset + from_bytes_offset, 1)[0]
+            while bitnumber != 0:
+                bitnumber = bitnumber & (bitnumber - 1)
+                inuse_block_count += 1
+            from_bytes_offset += 1
+            bytes_len -= 1
+
+        # last byte
+        for i in range(to_bytes_offset * 8, to_bitmap_idx):
+            if self.get_block_inuse_bit(i):
+                inuse_block_count += 1
+        return total_block_count - inuse_block_count
+
+    def set_blocks_inuse_bit_ingroup (self, group_idx, from_bitmap_idx, to_bitmap_idx, bit):
+        group_descriptor = self.group_descriptors[group_idx]
+        group_desc_table_offset = (0x400 // self.block_size + 1) * self.block_size
+        group_desc_offset = group_desc_table_offset + group_idx * self.superblock.s_desc_size
+        bitmap_offset = group_descriptor.bg_block_bitmap * self.block_size
+
+        # change free block count in superblock and group descriptor
+        free_block_change = 0
+        free_block_count = group_descriptor.bg_free_blocks_count + free_block_change
+        if bit:
+            free_block_change = -self.get_free_block_count_ingroup(group_idx, from_bitmap_idx, to_bitmap_idx)
+        else:
+            free_block_change = to_bitmap_idx - from_bitmap_idx - self.get_free_block_count_ingroup(group_idx, from_bitmap_idx, to_bitmap_idx)
+        # TODO: 64bit
+        self.write(group_desc_offset + 0xc, struct.pack("<I", free_block_count))
+        sb_free_block_count = self.superblock.s_free_blocks_count + free_block_change
+        self.write(0x400 + 0xc, struct.pack("<I", sb_free_block_count))
+        
+        # handle first byte in bitmap
+        if from_bitmap_idx % 8 != 0:
+            mid_bitmap_idx = from_bitmap_idx + 8 - from_bitmap_idx % 8
+            if mid_bitmap_idx > to_bitmap_idx:
+                mid_bitmap_idx = to_bitmap_idx
+            for i in range(from_bitmap_idx, mid_bitmap_idx):
+                self.set_block_inuse_bit(i, bit)
+            if mid_bitmap_idx == to_bitmap_idx:
+                return
+            from_bitmap_idx = mid_bitmap_idx
+
+        # middle bytes
+        from_bytes_offset = from_bitmap_idx // 8
+        to_bytes_offset = to_bitmap_idx // 8
+        bytes_len = to_bytes_offset - from_bytes_offset
+        if bytes_len:
+            self.write(bitmap_offset + from_bytes_offset, bytes([bit*0xff]) * bytes_len)
+        
+        # last byte
+        for i in range(to_bytes_offset * 8, to_bitmap_idx):
+            self.set_block_inuse_bit(i, bit)
+
+    def set_blocks_inuse_bit (self, from_block_idx, to_block_idx, bit):
+        from_group, from_bitmap_idx = self.get_block_group(from_block_idx)
+        to_group, to_bitmap_idx = self.get_block_group(to_block_idx)
+        if from_group == to_group:
+            self.set_blocks_inuse_bit_ingroup(from_group, from_bitmap_idx, to_bitmap_idx, bit)
+        else:
+            self.set_blocks_inuse_bit_ingroup(from_group, from_bitmap_idx, self.superblock.s_blocks_per_group, bit)
+            for i in range(from_group + 1, to_group):
+                self.set_blocks_inuse_bit_ingroup(i, 0, self.superblock.s_blocks_per_group, bit)
+            self.set_blocks_inuse_bit_ingroup(to_group, 0, to_bitmap_idx, bit)
+    
     def read (self, offset, byte_len):
         """
         Returns byte_len bytes at offset within this volume.
